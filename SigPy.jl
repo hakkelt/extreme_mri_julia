@@ -1,21 +1,213 @@
 module SigPy
 
-using Documenter, EllipsisNotation, FFTW, PaddedViews, SpecialFunctions, Base.Cartesian, Base.Threads
+using Documenter, EllipsisNotation, FFTW, PaddedViews, SpecialFunctions, Base.Cartesian, Setfield, LinearAlgebra
+
+using CUDAapi # this will NEVER fail
+if has_cuda()
+    #include("CuSigPy.jl")
+end
 
 export nufft, nufft_adjoint
+
+mutable struct fftPlanHolder
+    plan::Union{AbstractFFTs.Plan, Nothing}
+end
+
+struct NUFFT_plan{T}
+    coord::AbstractArray{T}
+    img_temp::SubArray
+    oversampled_img_temp::AbstractArray{Complex{T}}
+    oversampled_img_temp2::AbstractArray{Complex{T}}
+    kernel::AbstractArray{T}
+    FFTplan::fftPlanHolder
+    iFFTplan::fftPlanHolder
+    oversamp::Real
+    width::Int
+    n::Int
+    β::T
+    adjoint::Bool
+end
+
+Base.adjoint(plan::NUFFT_plan) = @set plan.adjoint = !plan.adjoint
+
+function nufft_plan(
+        coord::AbstractArray{T},
+        img::Union{AbstractArray{Complex{T}}, NTuple{N, Int}, Tuple, Nothing} = nothing;
+        oversamp::Real = 1.25,
+        width::Int = 4,
+        n::Int = 128) where {N, T}
+    
+    if img isa AbstractArray
+        img_shape = size(img)
+    elseif img isa NTuple
+        img_shape = img
+    elseif img isa Tuple
+        @assert(all(x -> x isa Int, img[1:end-1]) && img[end] isa EllipsisNotation.Ellipsis, 
+            "You must either specify all dimensions of the image as a tuple of Ints,
+                or you must specify the batch dimensions, and append an ellipsis mark ('..')
+                to denote the unknown image dimensions.")
+        img_shape = tuple(img[1:end-1]..., estimate_shape(coord)...)
+    else
+        img_shape = estimate_shape(coord)
+    end
+    
+    ndim = size(coord)[end]
+    all_dims = length(img_shape)
+    @assert(all_dims ≥ ndim,
+        "The size of coord along the last dimension should be greater or equal then the dimensionality of input.")
+    
+    β = convert(eltype(coord), π * √(((width / oversamp) * (oversamp - 0.5))^2 - 0.8))
+    oversampled_shape = _get_oversamp_shape(img_shape, ndim, oversamp)
+    shift = oversampled_shape .÷ 2 .- img_shape .÷ 2 .+ 1
+    view_range = UnitRange.(shift, shift .+ img_shape .- 1)
+    
+    oversampled_img_temp = similar(coord, Complex{eltype(coord)}, oversampled_shape)
+    img_temp = @view oversampled_img_temp[view_range...] # used for implicit cropping and zero padding
+    oversampled_img_temp2 = similar(coord, Complex{eltype(coord)}, oversampled_shape)
+    
+    coord = _scale_coord(coord, img_shape, oversamp)
+    
+    x = range(0, stop=n-1, step=1) ./ n
+    kernel = convert.(eltype(coord), window_kaiser_bessel.(x, width, β))
+    
+    NUFFT_plan(coord, img_temp, oversampled_img_temp, oversampled_img_temp2, kernel,
+        fftPlanHolder(nothing), fftPlanHolder(nothing), oversamp, width, n, β, false)
+end
+
+function nufft_plan(
+        coord::AbstractArray{T},
+        img::AbstractArray{T};
+        oversamp::Real = 1.25,
+        width::Int = 4,
+        n::Int = 128) where {N, T}
+    nufft_plan(coord, convert.(Complex{eltype(img)}, img), oversamp=oversamp, width=width, n=n)
+end
+
+function _nufft_forw(ksp::AbstractArray{Complex{T}}, plan::NUFFT_plan{T}, img::AbstractArray{Complex{T}}) where T
+    
+    ndim = size(plan.coord)[end]
+    plan.oversampled_img_temp .= zero(eltype(img)) # initialize oversampled buffer
+    
+    # Apodize
+    plan.img_temp .= img # Note that img_temp is a view to the centered region of oversampled_img_temp!
+    _apodize!(plan.img_temp, ndim, plan.oversamp, plan.width, plan.β)
+
+    # Zero-pad
+    img_shape = size(img)
+    plan.img_temp ./= convert(eltype(img), √(prod(img_shape[end-ndim+1:end])))
+
+    # FFT
+    all_dims = ndims(img)
+    dims = tuple((all_dims-ndim+1:all_dims)...)
+    ifftshift!(plan.oversampled_img_temp2, plan.oversampled_img_temp, dims)
+    (plan.FFTplan.plan isa Nothing) && (plan.FFTplan.plan = plan_fft!(plan.oversampled_img_temp2, dims))
+    plan.FFTplan.plan * plan.oversampled_img_temp2
+    fftshift!(plan.oversampled_img_temp, plan.oversampled_img_temp2, dims)
+
+    # Interpolate
+    if ndim == all_dims
+        interpolate_shaped_img = reshape(plan.oversampled_img_temp, 1, size(plan.oversampled_img_temp)...)
+        interpolate_shaped_ksp = reshape(ksp, 1, size(ksp)...)
+    else
+        interpolate_shaped_img = reshape(plan.oversampled_img_temp, :, size(plan.oversampled_img_temp)[end-ndim+1:end]...)
+        interpolate_shaped_ksp = reshape(ksp, :, size(ksp)[end])
+    end
+    interpolate!(interpolate_shaped_ksp, interpolate_shaped_img, plan.width, plan.kernel, plan.coord)
+    ksp
+end
+
+function _nufft_backw(img::AbstractArray{Complex{T}}, plan::NUFFT_plan{T}, ksp::AbstractArray{Complex{T}}) where T
+    
+    ndim = size(plan.coord)[end]
+    all_dims = ndims(img)
+    
+    # Gridding
+    oversampled_shape = size(plan.oversampled_img_temp)
+    plan.oversampled_img_temp .= zero(eltype(img)) # initialize oversized buffer
+    if ndim == all_dims
+        gridding_shaped_img = reshape(plan.oversampled_img_temp, 1, size(plan.oversampled_img_temp)...)
+        gridding_shaped_ksp = reshape(ksp, 1, size(ksp)...)
+    else
+        gridding_shaped_img = reshape(plan.oversampled_img_temp, :, size(plan.oversampled_img_temp)[end-ndim+1:end]...)
+        gridding_shaped_ksp = reshape(ksp, :, size(ksp)[end])
+    end
+    gridding!(gridding_shaped_img, gridding_shaped_ksp, oversampled_shape, plan.width, plan.kernel, plan.coord)
+    
+    # IFFT
+    dims = tuple((all_dims-ndim+1:all_dims)...)
+    ifftshift!(plan.oversampled_img_temp2, plan.oversampled_img_temp, dims)
+    (plan.iFFTplan.plan isa Nothing) && (plan.iFFTplan.plan = plan_ifft!(plan.oversampled_img_temp2, dims))
+    plan.iFFTplan.plan * plan.oversampled_img_temp2
+    fftshift!(plan.oversampled_img_temp, plan.oversampled_img_temp2, dims)
+
+    # "Crop" and scale
+    # Note that img_temp is a view to the centered region of oversampled_img_temp, so cropping is done implicitly.
+    oshape = size(plan.img_temp)
+    scaling_factor = convert(eltype(ksp), prod(oversampled_shape[end-ndim+1:end]) / √(prod(oshape[end-ndim+1:end])))
+    img .= plan.img_temp .* scaling_factor
+        
+    # Apodize
+    _apodize!(img, ndim, plan.oversamp, plan.width, plan.β)
+end
+
+function LinearAlgebra.mul!(
+        output::AbstractArray{Complex{T}},
+        plan::NUFFT_plan{T},
+        input::AbstractArray{Complex{T}}) where T
+    img = plan.adjoint ? output : input
+    
+    ndim = size(plan.coord)[end]
+    @assert(ndims(img) ≥ ndim,
+        "The size of coord along the last dimension should be greater or equal then the dimensionality of input.")
+    
+    @assert(size(plan.img_temp) == size(img),
+        "This plan was created for images of size $(size(plan.img_temp)), but image of size $(size(img)) is given.")
+    
+    #ksp = plan.adjoint ? input : output
+    #orig_shape = size(ksp)
+    #ndim = size(plan.coord)[end]
+    #batch_shape = size(img)[1:end-ndim]
+    #batch_size = prod(batch_shape)
+    #pts_shape = size(plan.coord)[1:end-1]
+    #npts = prod(pts_shape)
+    #ksp = reshape(ksp, (batch_size, npts))
+    
+    plan.adjoint ? _nufft_backw(output, plan, input) : _nufft_forw(output, plan, input)
+end
+
+function Base.:*(plan::NUFFT_plan{T}, input::AbstractArray{Complex{T}}) where T
+    
+    if plan.adjoint
+        output = plan.img_temp
+    else
+        ndim = size(plan.coord)[end]
+        batch_shape = size(input)[1:end-ndim]
+        batch_size = prod(batch_shape)
+        pts_shape = size(plan.coord)[1:end-1]
+        npts = prod(pts_shape)
+
+        output = zeros(eltype(input), (batch_shape..., npts))
+    end
+    
+    mul!(output, plan, input)
+end
+
+function Base.:*(plan::NUFFT_plan{T}, input::AbstractArray{T}) where T
+    plan * convert.(Complex{eltype(input)}, input)
+end
 
 @doc raw"""
 Non-uniform Fast Fourier Transform.
 
 **Arguments**:
+- `coord (ArrayType{T})`: Fourier domain coordinate array of shape ``(m_l, \ldots, m_1, ndim)``.
+    ``ndim`` determines the number of dimensions to apply the nufft.
+    `coord[..., i]` should be scaled to have its range ``[-n_i \div 2, n_i \div 2]``.
 - `input (ArrayType{T} or ArrayType{Complex{T}})`: input signal domain array of shape
     ``(n_k, \ldots, n_{ndim + 1}, n_{ndim}, \ldots, n_2, n_1)``,
     where ``ndim`` is specified by `size(coord)[end]`. The nufft
     is applied on the last ``ndim`` axes, and looped over
     the remaining axes. `ArrayType` can be any `AbstractArray`.
-- `coord (ArrayType{T})`: Fourier domain coordinate array of shape ``(m_l, \ldots, m_1, ndim)``.
-    ``ndim`` determines the number of dimensions to apply the nufft.
-    `coord[..., i]` should be scaled to have its range ``[-n_i \div 2, n_i \div 2]``.
 - `oversamp (Real)`: oversampling factor (default: $1.25$)
 - `width (Int)`: interpolation kernel full-width in terms of
     oversampled grid. (default: $4$)
@@ -35,55 +227,31 @@ Non-uniform Fast Fourier Transform.
 
 """
 function nufft(
-        input::AbstractArray{Complex{T}},
         coord::AbstractArray{T},
+        input::AbstractArray{Complex{T}};
         oversamp::Real = 1.25,
         width::Int = 4,
         n::Int = 128) where {T}
-    
-    ndim = size(coord)[end]
-    @assert(ndims(input) ≥ ndim,
-        "The size of coord along the last dimension should be greater or equal then the dimensionality of input.")
-    
-    β = convert(eltype(coord), π * √(((width / oversamp) * (oversamp - 0.5))^2 - 0.8))
-    shape = size(input)
-    oversampled_shape = _get_oversamp_shape(shape, ndim, oversamp)
-
-    output = copy(input)
-
-    # Apodize
-    _apodize!(output, ndim, oversamp, width, β)
-
-    # Zero-pad
-    output /= convert(eltype(input), √(prod(shape[end-ndim+1:end])))
-    shift = oversampled_shape .÷ 2 .- shape .÷ 2 .+ 1
-    output = PaddedView(0, output, oversampled_shape, shift)
-
-    # FFT
-    all_dims = ndims(input)
-    output = centering_fft!(convert.(Complex, output), tuple((all_dims-ndim+1:all_dims)...))
-
-    # Interpolate
-    coord = _scale_coord(coord, size(input), oversamp)
-    x = range(0, stop=n-1, step=1) ./ n
-    kernel = convert(eltype(coord), window_kaiser_bessel.(x, width, β))
-    return interpolate(output, width, kernel, coord)
-    
+    plan = nufft_plan(coord, input, oversamp=oversamp, width=width, n=n)
+    plan * input
 end
 
 function nufft(
-        input::AbstractArray{T},
         coord::AbstractArray{T},
+        input::AbstractArray{T};
         oversamp::T = 1.25,
         width::Int = 4,
         n::Int = 128) where {T<:Real}
-    return nufft(convert.(Complex, img), coord, oversamp, width)
+    nufft(coord, convert.(Complex, input), oversamp=oversamp, width=width, n=n)
 end
 
 @doc raw"""
 Adjoint non-uniform Fast Fourier Transform.
 
 **Arguments**:
+- `coord (ArrayType{T})`: Fourier domain coordinate array of shape ``(m_l, \ldots, m_1, ndim)``.
+    ``ndim`` determines the number of dimensions to apply the nufft.
+    `coord[..., i]` should be scaled to have its range ``[-n_i \div 2, n_i \div 2]``.
 - `input (ArrayType{T} or ArrayType{Complex{T}})`: input Fourier domain array of shape
     ``(n_k, \ldots, n_{l + 1}, m_l, \ldots, m_1)``,
     where ``ndim`` is specified by `size(coord)[end]`.
@@ -91,9 +259,6 @@ Adjoint non-uniform Fast Fourier Transform.
     of input must match the first dimensions of coord.
     The nufft_adjoint is applied on the last coord.ndim - 1 axes,
     and looped over the remaining axes.
-- `coord (ArrayType{T})`: Fourier domain coordinate array of shape ``(m_l, \ldots, m_1, ndim)``.
-    ``ndim`` determines the number of dimensions to apply the nufft.
-    `coord[..., i]` should be scaled to have its range ``[-n_i \div 2, n_i \div 2]``.
 - `oshape (NTuple{N, Int})`: output shape of the form
             ``(o_l, \ldots, o_{ndim + 1}, n_{ndim}, \ldots, n_2, n_1)``. (optional)
 - `oversamp (Real)`: oversampling factor (default: $1.25$)
@@ -116,52 +281,40 @@ Adjoint non-uniform Fast Fourier Transform.
 
 """
 function nufft_adjoint(
-        input::AbstractArray{Complex{T}},
         coord::AbstractArray{T},
+        input::AbstractArray{Complex{T}};
         oshape::Union{NTuple{N, Int}, Nothing} = nothing,
         oversamp::Real = 1.25,
         width::Int = 4,
         n::Int = 128) where {T, N}
-    
-    ndim = size(coord)[end]
-    
-    β = convert(eltype(coord), π * √(((width / oversamp) * (oversamp - 0.5))^2 - 0.8))
-    (oshape isa Nothing) && (oshape = tuple(size(input)[1:end-ndims(coord)+1]..., estimate_shape(coord)...))
-    oversampled_shape = _get_oversamp_shape(oshape, ndim, oversamp)
+    (oshape isa Nothing && ndims(input) > 1) && (oshape = tuple(size(input)[1:end-1]..., ..))
+    plan = nufft_plan(coord, oshape, oversamp=oversamp, width=width, n=n)
+    plan' * input
+end
 
-    # Gridding
-    coord = _scale_coord(coord, oshape, oversamp)
-    x = range(0, stop=n-1, step=1) ./ n
-    kernel = convert.(eltype(coord), window_kaiser_bessel.(x, width, β))
-    output = gridding(input, oversampled_shape, width, kernel, coord)
-
-    # IFFT
-    all_dims = ndims(output)
-    output = centering_ifft!(convert.(Complex, output), tuple((all_dims-ndim+1:all_dims)...))
-
-    # Crop
-    output = resize(output, oshape)
-    output .*= convert.(eltype(input), prod(oversampled_shape[end-ndim+1:end]) ./ √(prod(oshape[end-ndim+1:end])))
-
-    # Apodize
-    _apodize!(output, ndim, oversamp, width, β)
-
-    return output
+function nufft_adjoint(
+        coord::AbstractArray{T},
+        input::AbstractArray{T};
+        oshape::Union{NTuple{N, Int}, Nothing} = nothing,
+        oversamp::Real = 1.25,
+        width::Int = 4,
+        n::Int = 128) where {T, N}
+    nufft_adjoint(coord, convert.(Complex, input), oshape=oshape, oversamp=oversamp, width=width, n=n)
 end
 
 """
 Estimate array shape from coordinates.
 
-Shape is estimated by the different between maximum and minimum of
-coordinates in each axis.
+Shape is estimated by the difference between maximum and minimum of
+coordinates along each dimension.
 
 Args:
     `coord (AbstractArray)`: Coordinates.
 """
 function estimate_shape(coord)
     dims = tuple((1:ndims(coord)-1)...)
-    return floor.(Int, dropdims(maximum(coord, dims=dims), dims=dims) -
-        dropdims(minimum(coord, dims=dims), dims=(dims)))
+    return floor.(Int, Array(dropdims(maximum(coord, dims=dims), dims=dims) -
+        dropdims(minimum(coord, dims=dims), dims=dims)))
 end
 
 function fftshift!(
@@ -238,62 +391,30 @@ function centering_ifft!(
         input::AbstractArray{Complex{T},N},
         dims::Union{NTuple{K,Int},Nothing} = nothing) where {N,K,T}
     (dims isa Nothing) && (dims = tuple(collect(1:ndims(input))...))
-    output = ifftshift(input, dims)
+    output = similar(input)
+    ifftshift!(output, input, dims)
     ifft!(output, dims)
     fftshift!(input, output, dims)
     input
 end
 
-"""
-Resize with zero-padding or cropping.
-
-**Arguments**:
-    `input (AbstractArray{T,N})`: Input array.
-    `oshape (NTuple{N,Int})`: Output shape.
-    `ishift (NTuple{N,Int})`: Input shift (optional).
-    `oshift (NTuple{N,Int})`: Output shift (optional).
-
-**Returns**:
-    `array`: Zero-padded or cropped result.
-"""
-function resize(
-        input::AbstractArray{T,N},
-        oshape::NTuple{N,Int},
-        ishift::Union{NTuple{N,Int}, Nothing} = nothing,
-        oshift::Union{NTuple{N,Int}, Nothing} = nothing) where {N,T}
+function crop(input::AbstractArray, oshape::NTuple)
 
     ishape1, oshape1 = _expand_shapes(size(input), oshape)
-
-    if ishape1 == oshape1
-        return reshape(input, oshape)
-    end
-
-    if ishift isa Nothing
-        ishift = [max(i ÷ 2 - o ÷ 2, 0) for (i, o) in zip(collect(ishape1), collect(oshape1))]
-    end
-
-    if oshift isa Nothing
-        oshift = [max(o ÷ 2 - i ÷ 2, 0) for (i, o) in zip(collect(ishape1), collect(oshape1))]
-    end
+    ishift = [max(i ÷ 2 - o ÷ 2, 0) for (i, o) in zip(collect(ishape1), collect(oshape1))]
+    oshift = [max(o ÷ 2 - i ÷ 2, 0) for (i, o) in zip(collect(ishape1), collect(oshape1))]
 
     copy_shape = [min(i - si, o - so)
                   for (i, si, o, so) in zip(collect(ishape1), ishift, collect(oshape1), oshift)]
     islice = collect(si+1:si+c for (si, c) in zip(ishift, copy_shape))
-    oslice = collect(so+1:so+c for (so, c) in zip(oshift, copy_shape))
-
-    output = zeros(eltype(input), oshape1)
-    input = reshape(input, ishape1)
-    output[oslice...] = input[islice...]
-
-    return reshape(output, oshape)
+    return input[islice...]
 end
 
 function _get_oversamp_shape(shape, ndim, oversamp)
     return tuple(vcat(shape[1:end-ndim]..., [ceil(Int, oversamp * i) for i in shape[end-ndim+1:end]]...)...)
 end
 
-function _apodize!(signal, apodized_dims, oversamp, width, β)
-    
+function _apodize!(signal::AbstractArray, apodized_dims, oversamp, width, β)
     all_dims = ndims(signal)
     untouched_dims = all_dims - apodized_dims
     for axis in range(untouched_dims + 1, all_dims, step=1)
@@ -318,10 +439,13 @@ end
 
 function _scale_coord(coord, shape, oversamp)
     ndim = size(coord)[end]
-    broadcast_dims = tuple(repeat([1], ndims(coord)-1)..., ndim)
-    scale = convert.(eltype(coord), reshape([ceil(oversamp * i) / i for i in shape[end-ndim+1:end]], broadcast_dims))
-    shift = convert.(eltype(coord), reshape([ceil(oversamp * i) ÷ 2 for i in shape[end-ndim+1:end]], broadcast_dims))
-    return scale .* coord .+ shift
+    coord = copy(coord)
+    for (i,d) in enumerate(shape[end-ndim+1:end])
+        scale = convert(eltype(coord), ceil(oversamp * d) / d)
+        shift = convert(eltype(coord), ceil(oversamp * d) ÷ 2)
+        @views coord[.., i] .= coord[.., i] .* scale .+ shift
+    end
+    return coord
 end
 
 window_kaiser_bessel(x::Real, m::Int, β::Real) = 1 / m * besseli(0, β * √(1 - x^2))
@@ -359,6 +483,21 @@ function interpolate(
         kernel::AbstractArray{T, 1},
         coord::AbstractArray{T}) where {T<:Real}
     ndim = size(coord, 2)
+    batch_shape = size(input)[1:end-ndim]
+    batch_size = prod(batch_shape)
+    pts_shape = size(coord)[1:end-1]
+    npts = prod(pts_shape)
+    output = zeros(eltype(input), (batch_size, npts))
+    interpolate!(output, input, width, kernel, coord)
+end
+
+function interpolate!(
+        output::AbstractArray,
+        input::AbstractArray,
+        width::Int,
+        kernel::AbstractArray{T, 1},
+        coord::AbstractArray{T}) where {T<:Real}
+    ndim = size(coord, 2)
     npts = size(coord, 1)
     @assert(ndims(input) ≥ ndim, "The size of coord along the last dimension
         should be greater or equal then the dimensionality of input.")
@@ -382,7 +521,6 @@ function interpolate(
 
     input = reshape(input, tuple(batch_size, size(input)[end-ndim+1:end]...))
     coord = reshape(coord, (npts, ndim))
-    output = zeros(eltype(input), (batch_size, npts))
 
     _interpolate!(output, input, coord, kernel, width)
 
@@ -418,6 +556,20 @@ function gridding(
         width::Int,
         kernel::AbstractArray{T, 1},
         coord::AbstractArray{T}) where {T<:Real, D}
+    ndim = size(coord)[end]
+    batch_shape = oshape[1:end-ndim]
+    batch_size = prod(batch_shape)
+    output = zeros(eltype(input), tuple(batch_size, oshape[end-ndim+1:end]...))
+    gridding!(output, input, oshape, width, kernel, coord)
+end
+    
+function gridding!(
+        output::AbstractArray,
+        input::AbstractArray,
+        oshape::NTuple{D, Int},
+        width::Int,
+        kernel::AbstractArray{T, 1},
+        coord::AbstractArray{T}) where {T<:Real, D}
     
     ndim = size(coord)[end]
     batch_shape = oshape[1:end-ndim]
@@ -436,17 +588,15 @@ function gridding(
         @assert(eltype(input) == eltype(coord),
             "Precision of eltype of input and coord should match: $(eltype(input)) vs $(eltype(coord))")
     end
-
+    
     input = reshape(input, tuple(batch_size, npts))
     coord = reshape(coord, (npts, ndim))
-    output = zeros(eltype(input), tuple(batch_size, oshape[end-ndim+1:end]...))
+    output = _gridding!(output, input, coord, kernel, width)
 
-    _gridding!(output, input, coord, kernel, width)
-
-    return reshape(output, oshape)
+    reshape(output, oshape)
 end
 
-function lin_interpolate(kernel::AbstractArray{T,1}, x::T)::T where T
+function lin_interpolate(kernel::AbstractArray{T,1}, x::T) where T
     x >= 1 && return zero(x)
     
     n = length(kernel)
@@ -475,9 +625,11 @@ macro interpolate_point(ndim)
         @nloops($ndim, i, d -> interval_start_d:interval_end_d,
             d -> w_d = w_{d+1} *
                 lin_interpolate(kernel, convert(eltype(kernel), abs(i_d - interval_middle_d) / (width / 2))),
-            for b in 1:batch_size
-                output[b, point_index] += w_1 * input[b,
-                    @ntuple($ndim, d -> (i_{$ndim-d+1} + n_{$ndim-d+1}) % n_{$ndim-d+1} + 1)...]
+            begin
+                position = @ntuple($ndim, d -> (i_{$ndim-d+1} + n_{$ndim-d+1}) % n_{$ndim-d+1} + 1)
+                for b in 1:batch_size
+                    output[b, point_index] += w_1 * input[b, position...]
+                end
             end)
     end)
 end
@@ -498,9 +650,11 @@ macro gridding_point(ndim)
         @nloops($ndim, i, d -> interval_start_d:interval_end_d,
             d -> w_d = w_{d+1} *
                 lin_interpolate(kernel, convert(eltype(kernel), abs(i_d - interval_middle_d) / (width / 2))),
-            for b in 1:batch_size
-                output[thread_id][b, @ntuple($ndim, d -> (i_{$ndim-d+1} + n_{$ndim-d+1}) % n_{$ndim-d+1} + 1)...] +=
-                    w_1 * input[b, point_index] 
+            begin
+                position = @ntuple($ndim, d -> (i_{$ndim-d+1} + n_{$ndim-d+1}) % n_{$ndim-d+1} + 1)
+                for b in 1:batch_size
+                    output[thread_id][b, position...] += w_1 * input[b, point_index] 
+                end
             end)
     end)
 end
@@ -602,11 +756,11 @@ end
 end
 
 function __gridding!(
-        output::AbstractArray,
-        input::AbstractArray{Complex{T}, 2},
-        coord::AbstractArray{T, 2},
-        kernel::AbstractArray{T, 1},
-        width::Int) where {T, D}
+        output::AbstractArray{T1, D},
+        input::AbstractArray{T1, 2},
+        coord::AbstractArray{T2, 2},
+        kernel::AbstractArray{T2, 1},
+        width::Int) where {T1, T2, D}
     if Threads.nthreads() > 1 && # if threading enabled
             size(input, 2) > 10000 && # if the problem large enough
             Sys.free_memory() * .8 > sizeof(output) * (Threads.nthreads()-1) # if we have enough memory
@@ -622,6 +776,7 @@ function __gridding!(
             _gridding_point!((output,), input, coord, kernel, width, point_index, 1)
         end
     end
+    output
 end
 
 function _gridding!(
@@ -640,6 +795,50 @@ function _gridding!(
         kernel::AbstractArray{T, 1},
         width::Int) where {T, D}
     __gridding!(output, input, coord, kernel, width)
+end
+
+"""
+Resize with zero-padding or cropping.
+
+**Arguments**:
+    `input (AbstractArray{T,N})`: Input array.
+    `oshape (NTuple{N,Int})`: Output shape.
+    `ishift (NTuple{N,Int})`: Input shift (optional).
+    `oshift (NTuple{N,Int})`: Output shift (optional).
+
+**Returns**:
+    `array`: Zero-padded or cropped result.
+"""
+function resize(
+        input::AbstractArray{T,N},
+        oshape::NTuple{N,Int},
+        ishift::Union{NTuple{N,Int}, Nothing} = nothing,
+        oshift::Union{NTuple{N,Int}, Nothing} = nothing) where {N,T}
+
+    ishape1, oshape1 = _expand_shapes(size(input), oshape)
+
+    if ishape1 == oshape1
+        return reshape(input, oshape)
+    end
+
+    if ishift isa Nothing
+        ishift = [max(i ÷ 2 - o ÷ 2, 0) for (i, o) in zip(collect(ishape1), collect(oshape1))]
+    end
+
+    if oshift isa Nothing
+        oshift = [max(o ÷ 2 - i ÷ 2, 0) for (i, o) in zip(collect(ishape1), collect(oshape1))]
+    end
+
+    copy_shape = [min(i - si, o - so)
+                  for (i, si, o, so) in zip(collect(ishape1), ishift, collect(oshape1), oshift)]
+    islice = collect(si+1:si+c for (si, c) in zip(ishift, copy_shape))
+    oslice = collect(so+1:so+c for (so, c) in zip(oshift, copy_shape))
+
+    output = zeros(eltype(input), oshape1)
+    input = reshape(input, ishape1)
+    output[oslice...] = input[islice...]
+
+    return reshape(output, oshape)
 end
 
 end # end module
