@@ -1,6 +1,6 @@
 module SigPy
 
-using Documenter, EllipsisNotation, FFTW, PaddedViews, SpecialFunctions, Base.Cartesian, Setfield, LinearAlgebra
+using Documenter, EllipsisNotation, FFTW, PaddedViews, SpecialFunctions, Base.Cartesian, Setfield, LinearAlgebra, ProgressMeter
 
 using CUDAapi # this will NEVER fail
 if has_cuda()
@@ -26,6 +26,8 @@ struct NUFFT_plan{T}
     n::Int
     β::T
     adjoint::Bool
+    progressTitle::Union{String, Nothing}
+    progress_dt::Real
 end
 
 Base.adjoint(plan::NUFFT_plan) = @set plan.adjoint = !plan.adjoint
@@ -35,7 +37,9 @@ function nufft_plan(
         img::Union{AbstractArray{Complex{T}}, NTuple{N, Int}, Tuple, Nothing} = nothing;
         oversamp::Real = 1.25,
         width::Int = 4,
-        n::Int = 128) where {N, T}
+        n::Int = 128,
+        progressTitle::Union{String, Nothing} = nothing,
+        progress_dt::Real = 1) where {N, T}
     
     if img isa AbstractArray
         img_shape = size(img)
@@ -71,7 +75,7 @@ function nufft_plan(
     kernel = convert.(eltype(coord), window_kaiser_bessel.(x, width, β))
     
     NUFFT_plan(coord, img_temp, oversampled_img_temp, oversampled_img_temp2, kernel,
-        fftPlanHolder(nothing), fftPlanHolder(nothing), oversamp, width, n, β, false)
+        fftPlanHolder(nothing), fftPlanHolder(nothing), oversamp, width, n, β, false, progressTitle, progress_dt)
 end
 
 function nufft_plan(
@@ -79,8 +83,10 @@ function nufft_plan(
         img::AbstractArray{T};
         oversamp::Real = 1.25,
         width::Int = 4,
-        n::Int = 128) where {N, T}
-    nufft_plan(coord, convert.(Complex{eltype(img)}, img), oversamp=oversamp, width=width, n=n)
+        n::Int = 128,
+        progressTitle::Union{String, Nothing} = nothing,
+        progress_dt::Real = 1) where {N, T}
+    nufft_plan(coord, convert.(Complex{eltype(img)}, img), oversamp=oversamp, width=width, n=n, progressTitle=progressTitle, progress_dt=progress_dt)
 end
 
 function _nufft_forw(ksp::AbstractArray{Complex{T}}, plan::NUFFT_plan{T}, img::AbstractArray{Complex{T}}) where T
@@ -88,13 +94,20 @@ function _nufft_forw(ksp::AbstractArray{Complex{T}}, plan::NUFFT_plan{T}, img::A
     ndim = size(plan.coord)[end]
     plan.oversampled_img_temp .= zero(eltype(img)) # initialize oversampled buffer
     
+    if !(plan.progressTitle isa Nothing)
+        (p = Progress(length(plan.coord) ÷ ndim + 2, plan.progress_dt, plan.progressTitle))
+        update!(p, 0)
+    else
+        p = nothing
+    end
+    
     # Apodize
     plan.img_temp .= img # Note that img_temp is a view to the centered region of oversampled_img_temp!
     _apodize!(plan.img_temp, ndim, plan.oversamp, plan.width, plan.β)
-
-    # Zero-pad
     img_shape = size(img)
     plan.img_temp ./= convert(eltype(img), √(prod(img_shape[end-ndim+1:end])))
+    
+    !(plan.progressTitle isa Nothing) && next!(p)
 
     # FFT
     all_dims = ndims(img)
@@ -103,6 +116,8 @@ function _nufft_forw(ksp::AbstractArray{Complex{T}}, plan::NUFFT_plan{T}, img::A
     (plan.FFTplan.plan isa Nothing) && (plan.FFTplan.plan = plan_fft!(plan.oversampled_img_temp2, dims))
     plan.FFTplan.plan * plan.oversampled_img_temp2
     fftshift!(plan.oversampled_img_temp, plan.oversampled_img_temp2, dims)
+    
+    !(plan.progressTitle isa Nothing) && next!(p)
 
     # Interpolate
     if ndim == all_dims
@@ -112,7 +127,7 @@ function _nufft_forw(ksp::AbstractArray{Complex{T}}, plan::NUFFT_plan{T}, img::A
         interpolate_shaped_img = reshape(plan.oversampled_img_temp, :, size(plan.oversampled_img_temp)[end-ndim+1:end]...)
         interpolate_shaped_ksp = reshape(ksp, :, size(ksp)[end])
     end
-    interpolate!(interpolate_shaped_ksp, interpolate_shaped_img, plan.width, plan.kernel, plan.coord)
+    interpolate!(interpolate_shaped_ksp, interpolate_shaped_img, plan.width, plan.kernel, plan.coord, p)
     ksp
 end
 
@@ -120,6 +135,13 @@ function _nufft_backw(img::AbstractArray{Complex{T}}, plan::NUFFT_plan{T}, ksp::
     
     ndim = size(plan.coord)[end]
     all_dims = ndims(img)
+    
+    if !(plan.progressTitle isa Nothing)
+        (p = Progress(length(plan.coord) ÷ ndim + 2, plan.progress_dt, plan.progressTitle))
+        update!(p, 0)
+    else
+        p = nothing
+    end
     
     # Gridding
     oversampled_shape = size(plan.oversampled_img_temp)
@@ -131,7 +153,9 @@ function _nufft_backw(img::AbstractArray{Complex{T}}, plan::NUFFT_plan{T}, ksp::
         gridding_shaped_img = reshape(plan.oversampled_img_temp, :, size(plan.oversampled_img_temp)[end-ndim+1:end]...)
         gridding_shaped_ksp = reshape(ksp, :, size(ksp)[end])
     end
-    gridding!(gridding_shaped_img, gridding_shaped_ksp, oversampled_shape, plan.width, plan.kernel, plan.coord)
+    gridding!(gridding_shaped_img, gridding_shaped_ksp, oversampled_shape, plan.width, plan.kernel, plan.coord, p)
+    
+    !(plan.progressTitle isa Nothing) && next!(p)
     
     # IFFT
     dims = tuple((all_dims-ndim+1:all_dims)...)
@@ -139,6 +163,8 @@ function _nufft_backw(img::AbstractArray{Complex{T}}, plan::NUFFT_plan{T}, ksp::
     (plan.iFFTplan.plan isa Nothing) && (plan.iFFTplan.plan = plan_ifft!(plan.oversampled_img_temp2, dims))
     plan.iFFTplan.plan * plan.oversampled_img_temp2
     fftshift!(plan.oversampled_img_temp, plan.oversampled_img_temp2, dims)
+    
+    !(plan.progressTitle isa Nothing) && next!(p)
 
     # "Crop" and scale
     # Note that img_temp is a view to the centered region of oversampled_img_temp, so cropping is done implicitly.
@@ -148,6 +174,10 @@ function _nufft_backw(img::AbstractArray{Complex{T}}, plan::NUFFT_plan{T}, ksp::
         
     # Apodize
     _apodize!(img, ndim, plan.oversamp, plan.width, plan.β)
+    
+    !(plan.progressTitle isa Nothing) && finish!(p)
+    
+    img
 end
 
 function LinearAlgebra.mul!(
@@ -231,8 +261,10 @@ function nufft(
         input::AbstractArray{Complex{T}};
         oversamp::Real = 1.25,
         width::Int = 4,
-        n::Int = 128) where {T}
-    plan = nufft_plan(coord, input, oversamp=oversamp, width=width, n=n)
+        n::Int = 128,
+        progressTitle::Union{String, Nothing} = nothing,
+        progress_dt::Real = 1) where {T}
+    plan = nufft_plan(coord, input, oversamp=oversamp, width=width, n=n, progressTitle=progressTitle, progress_dt=progress_dt)
     plan * input
 end
 
@@ -241,8 +273,36 @@ function nufft(
         input::AbstractArray{T};
         oversamp::T = 1.25,
         width::Int = 4,
-        n::Int = 128) where {T<:Real}
-    nufft(coord, convert.(Complex, input), oversamp=oversamp, width=width, n=n)
+        n::Int = 128,
+        progressTitle::Union{String, Nothing} = nothing,
+        progress_dt::Real = 1) where {T}
+    nufft(coord, convert.(Complex, input), oversamp=oversamp, width=width, n=n, progressTitle=progressTitle, progress_dt=progress_dt)
+end
+
+function nufft!(
+        output::AbstractArray{Complex{T}},
+        coord::AbstractArray{T},
+        input::AbstractArray{Complex{T}};
+        oversamp::Real = 1.25,
+        width::Real = 4,
+        n::Int = 128,
+        progressTitle::Union{String, Nothing} = nothing,
+        progress_dt::Real = 1) where {T}
+    plan = nufft_plan(coord, input, oversamp=oversamp, width=width, n=n, progressTitle, progress_dt)
+    mul!(output, plan, input)
+end
+
+function nufft!(
+        output::AbstractArray{Complex{T}},
+        coord::AbstractArray{T},
+        input::AbstractArray{T};
+        oversamp::T = 1.25,
+        width::Real = 4,
+        n::Int = 128,
+        progressTitle::Union{String, Nothing} = nothing,
+        progress_dt::Real = 1) where {T<:Real}
+    nufft!(output, coord, convert.(Complex, input), oversamp=oversamp, width=width, n=n,
+        progressTitle=progressTitle, progress_dt=progress_dt)
 end
 
 @doc raw"""
@@ -286,9 +346,11 @@ function nufft_adjoint(
         oshape::Union{NTuple{N, Int}, Nothing} = nothing,
         oversamp::Real = 1.25,
         width::Int = 4,
-        n::Int = 128) where {T, N}
+        n::Int = 128,
+        progressTitle::Union{String, Nothing} = nothing,
+        progress_dt::Real = 1) where {T, N}
     (oshape isa Nothing && ndims(input) > 1) && (oshape = tuple(size(input)[1:end-1]..., ..))
-    plan = nufft_plan(coord, oshape, oversamp=oversamp, width=width, n=n)
+    plan = nufft_plan(coord, oshape, oversamp=oversamp, width=width, n=n, progressTitle=progressTitle, progress_dt=progress_dt)
     plan' * input
 end
 
@@ -298,8 +360,40 @@ function nufft_adjoint(
         oshape::Union{NTuple{N, Int}, Nothing} = nothing,
         oversamp::Real = 1.25,
         width::Int = 4,
-        n::Int = 128) where {T, N}
-    nufft_adjoint(coord, convert.(Complex, input), oshape=oshape, oversamp=oversamp, width=width, n=n)
+        n::Int = 128,
+        progressTitle::Union{String, Nothing} = nothing,
+        progress_dt::Real = 1) where {T, N}
+    nufft_adjoint(coord, convert.(Complex, input), oshape=oshape, oversamp=oversamp, width=width, n=n, progressTitle=progressTitle, progress_dt=progress_dt)
+end
+
+function nufft_adjoint!(
+        output::AbstractArray{Complex{T}},
+        coord::AbstractArray{T},
+        input::AbstractArray{Complex{T}};
+        oshape::Union{NTuple{N, Int}, Nothing} = nothing,
+        oversamp::Real = 1.25,
+        width::Real = 4,
+        n::Int = 128,
+        progressTitle::Union{String, Nothing} = nothing,
+        progress_dt::Real = 1) where {T, N}
+    (oshape isa Nothing && ndims(input) > 1) && (oshape = tuple(size(input)[1:end-1]..., ..))
+    plan = nufft_plan(coord, oshape, oversamp=oversamp, width=width, n=n,
+        progressTitle=progressTitle, progress_dt=progress_dt)
+    mul!(output, plan', input)
+end
+
+function nufft_adjoint!(
+        output::AbstractArray{Complex{T}},
+        coord::AbstractArray{T},
+        input::AbstractArray{T};
+        oshape::Union{NTuple{N, Int}, Nothing} = nothing,
+        oversamp::Real = 1.25,
+        width::Real = 4,
+        n::Int = 128,
+        progressTitle::Union{String, Nothing} = nothing,
+        progress_dt::Real = 1) where {T, N}
+    nufft_adjoint!(output, coord, convert.(Complex, input), oshape=oshape, oversamp=oversamp, width=width, n=n,
+        progressTitle=progressTitle, progress_dt=progress_dt)
 end
 
 """
@@ -477,26 +571,13 @@ end
     **Returns**:
         `output (AbstractArray)`: Output array of shape ``(m_l, \ldots, m_1)``
     """
-function interpolate(
-        input::AbstractArray,
-        width::Int,
-        kernel::AbstractArray{T, 1},
-        coord::AbstractArray{T}) where {T<:Real}
-    ndim = size(coord, 2)
-    batch_shape = size(input)[1:end-ndim]
-    batch_size = prod(batch_shape)
-    pts_shape = size(coord)[1:end-1]
-    npts = prod(pts_shape)
-    output = zeros(eltype(input), (batch_size, npts))
-    interpolate!(output, input, width, kernel, coord)
-end
-
 function interpolate!(
         output::AbstractArray,
         input::AbstractArray,
         width::Int,
         kernel::AbstractArray{T, 1},
-        coord::AbstractArray{T}) where {T<:Real}
+        coord::AbstractArray{T},
+        p::Union{Progress,Nothing} = nothing) where {T<:Real}
     ndim = size(coord, 2)
     npts = size(coord, 1)
     @assert(ndims(input) ≥ ndim, "The size of coord along the last dimension
@@ -522,7 +603,7 @@ function interpolate!(
     input = reshape(input, tuple(batch_size, size(input)[end-ndim+1:end]...))
     coord = reshape(coord, (npts, ndim))
 
-    _interpolate!(output, input, coord, kernel, width)
+    _interpolate!(output, input, coord, kernel, width, p)
 
     return reshape(output, tuple(batch_shape..., pts_shape...))
 end
@@ -549,27 +630,15 @@ end
 
     **Returns**:
         `output (AbstractArray)`: Output array.
-    """
-function gridding(
-        input::AbstractArray,
-        oshape::NTuple{D, Int},
-        width::Int,
-        kernel::AbstractArray{T, 1},
-        coord::AbstractArray{T}) where {T<:Real, D}
-    ndim = size(coord)[end]
-    batch_shape = oshape[1:end-ndim]
-    batch_size = prod(batch_shape)
-    output = zeros(eltype(input), tuple(batch_size, oshape[end-ndim+1:end]...))
-    gridding!(output, input, oshape, width, kernel, coord)
-end
-    
+    """    
 function gridding!(
         output::AbstractArray,
         input::AbstractArray,
         oshape::NTuple{D, Int},
         width::Int,
         kernel::AbstractArray{T, 1},
-        coord::AbstractArray{T}) where {T<:Real, D}
+        coord::AbstractArray{T},
+        p::Union{Progress,Nothing} = nothing) where {D, T<:Real}
     
     ndim = size(coord)[end]
     batch_shape = oshape[1:end-ndim]
@@ -591,7 +660,7 @@ function gridding!(
     
     input = reshape(input, tuple(batch_size, npts))
     coord = reshape(coord, (npts, ndim))
-    output = _gridding!(output, input, coord, kernel, width)
+    output = _gridding!(output, input, coord, kernel, width, p)
 
     reshape(output, oshape)
 end
@@ -626,7 +695,7 @@ macro interpolate_point(ndim)
             d -> w_d = w_{d+1} *
                 lin_interpolate(kernel, convert(eltype(kernel), abs(i_d - interval_middle_d) / (width / 2))),
             begin
-                position = @ntuple($ndim, d -> (i_{$ndim-d+1} + n_{$ndim-d+1}) % n_{$ndim-d+1} + 1)
+                position = @ntuple($ndim, d -> mod(i_{$ndim-d+1}, n_{$ndim-d+1}) + 1)
                 for b in 1:batch_size
                     output[b, point_index] += w_1 * input[b, position...]
                 end
@@ -651,7 +720,7 @@ macro gridding_point(ndim)
             d -> w_d = w_{d+1} *
                 lin_interpolate(kernel, convert(eltype(kernel), abs(i_d - interval_middle_d) / (width / 2))),
             begin
-                position = @ntuple($ndim, d -> (i_{$ndim-d+1} + n_{$ndim-d+1}) % n_{$ndim-d+1} + 1)
+                position = @ntuple($ndim, d -> mod(i_{$ndim-d+1}, n_{$ndim-d+1}) + 1)
                 for b in 1:batch_size
                     output[thread_id][b, position...] += w_1 * input[b, point_index] 
                 end
@@ -712,9 +781,11 @@ function _interpolate!(
         input::AbstractArray{Complex{T}, D},
         coord::AbstractArray{T, 2},
         kernel::AbstractArray{T, 1},
-        width::Int) where {T, D}
+        width::Int,
+        p::Union{Progress,Nothing} = nothing) where {T, D}
     Threads.@threads for point_index in 1:size(coord, 1)
         _interpolate_point!(output, input, coord, kernel, width, point_index)
+        !(p isa Nothing) && next!(p)
     end
 end
 
@@ -723,9 +794,11 @@ function _interpolate!(
         input::AbstractArray{T, D},
         coord::AbstractArray{T, 2},
         kernel::AbstractArray{T, 1},
-        width::Int) where {T, D}
+        width::Int,
+        p::Union{Progress,Nothing} = nothing) where {T, D}
     Threads.@threads for point_index in 1:size(coord, 1)
         _interpolate_point!(output, input, coord, kernel, width, point_index)
+        !(p isa Nothing) && next!(p)
     end
 end
 
@@ -760,13 +833,15 @@ function __gridding!(
         input::AbstractArray{T1, 2},
         coord::AbstractArray{T2, 2},
         kernel::AbstractArray{T2, 1},
-        width::Int) where {T1, T2, D}
+        width::Int,
+        p::Union{Progress,Nothing} = nothing) where {T1, T2, D}
     if Threads.nthreads() > 1 && # if threading enabled
             size(input, 2) > 10000 && # if the problem large enough
             Sys.free_memory() * .8 > sizeof(output) * (Threads.nthreads()-1) # if we have enough memory
         threaded_output = tuple(output, [copy(output) for _ in 2:Threads.nthreads()]...)
         Threads.@threads for point_index in 1:size(coord, 1)
             _gridding_point!(threaded_output, input, coord, kernel, width, point_index, Threads.threadid())
+            !(p isa Nothing) && next!(p)
         end
         for i in 2:length(threaded_output)
             output .+= threaded_output[i]
@@ -774,6 +849,7 @@ function __gridding!(
     else
         for point_index in 1:size(coord, 1)
             _gridding_point!((output,), input, coord, kernel, width, point_index, 1)
+            !(p isa Nothing) && next!(p)
         end
     end
     output
@@ -784,8 +860,9 @@ function _gridding!(
         input::AbstractArray{Complex{T}, 2},
         coord::AbstractArray{T, 2},
         kernel::AbstractArray{T, 1},
-        width::Int) where {T, D}
-    __gridding!(output, input, coord, kernel, width)
+        width::Int,
+        p::Union{Progress,Nothing} = nothing) where {T, D}
+    __gridding!(output, input, coord, kernel, width, p)
 end
 
 function _gridding!(
@@ -793,8 +870,9 @@ function _gridding!(
         input::AbstractArray{T, 2},
         coord::AbstractArray{T, 2},
         kernel::AbstractArray{T, 1},
-        width::Int) where {T, D}
-    __gridding!(output, input, coord, kernel, width)
+        width::Int,
+        p::Union{Progress,Nothing} = nothing) where {T, D}
+    __gridding!(output, input, coord, kernel, width, p)
 end
 
 """
