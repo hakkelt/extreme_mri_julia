@@ -47,9 +47,9 @@ version = "0.5.0"
 
 [[BinDeps]]
 deps = ["Libdl", "Pkg", "SHA", "URIParser", "Unicode"]
-git-tree-sha1 = "66158ad56b4bf6cc8413b37d0b7bc52402682764"
+git-tree-sha1 = "46cf2c1668ad07aba5a9d331bdeea994a1f13856"
 uuid = "9e28174c-4ba2-5203-b857-d8d62c4213ee"
-version = "1.0.0"
+version = "1.0.1"
 
 [[BinaryProvider]]
 deps = ["Libdl", "SHA"]
@@ -234,9 +234,9 @@ version = "0.8.1"
 
 [[Documenter]]
 deps = ["Base64", "Dates", "DocStringExtensions", "InteractiveUtils", "JSON", "LibGit2", "Logging", "Markdown", "REPL", "Test", "Unicode"]
-git-tree-sha1 = "f4c8a9965af27e3c4d1c7b248f6db102e8e3a74e"
+git-tree-sha1 = "bc99c157ff2957c058a1067061d16c2c83d1ec42"
 uuid = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
-version = "0.24.8"
+version = "0.24.9"
 
 [[EllipsisNotation]]
 git-tree-sha1 = "65dad386e877850e6fce4fc77f60fe75a468ce9d"
@@ -295,6 +295,9 @@ git-tree-sha1 = "3d7cb2c4c850439f19c4d6d3fbe1dce6481cddb1"
 uuid = "5789e2e9-d7fb-5bc7-8068-2c6fae9b9549"
 version = "1.2.4"
 
+[[FileWatching]]
+uuid = "7b1f6079-737a-58dc-b8bc-7a2ca5c1b5ee"
+
 [[FillArrays]]
 deps = ["LinearAlgebra", "Random", "SparseArrays"]
 git-tree-sha1 = "51cc2f9bc4eb9c6c0e81ec2f779d1085583cc956"
@@ -320,9 +323,9 @@ version = "1.0.5+2"
 
 [[FunctionOperators]]
 deps = ["LaTeXStrings", "LinearAlgebra", "MacroTools", "Parameters", "Printf"]
-git-tree-sha1 = "0e2892a1d6e9910096995f447ceeb87f84e5bc2a"
+path = "dev/FunctionOperators"
 uuid = "98ce4118-165c-488a-9b71-2bb5aff4e594"
-version = "0.2.0"
+version = "0.2.1"
 
 [[Future]]
 deps = ["Random"]
@@ -353,16 +356,10 @@ uuid = "a2bd30eb-e257-5431-a919-1863eab51364"
 version = "1.0.2"
 
 [[HDF5]]
-deps = ["Blosc", "HDF5_jll", "Libdl", "Mmap", "Random"]
-git-tree-sha1 = "cf80ef0b7333e03d78ab6516b56f31f4f7ffa4ae"
+deps = ["BinaryProvider", "Blosc", "CMakeWrapper", "Libdl", "Mmap"]
+git-tree-sha1 = "d3ea5532668bf9bdd5e8d5f16571e0b520cbbb9f"
 uuid = "f67ccb44-e63f-5c2f-98bd-6dc0ccc4ba2f"
-version = "0.13.1"
-
-[[HDF5_jll]]
-deps = ["Libdl", "Pkg", "Zlib_jll"]
-git-tree-sha1 = "85bd2e586a10ae0eab856125bf5245e0d36384a7"
-uuid = "0234f1f7-429e-5d53-9886-15a909be8d59"
-version = "1.10.5+5"
+version = "0.12.5"
 
 [[IdentityRanges]]
 deps = ["OffsetArrays"]
@@ -378,9 +375,9 @@ version = "0.6.4"
 
 [[ImageCore]]
 deps = ["Colors", "FixedPointNumbers", "Graphics", "MappedArrays", "MosaicViews", "OffsetArrays", "PaddedViews", "Reexport", "Requires"]
-git-tree-sha1 = "4aa7db337d48529a0a9f6e31ed5ed0a805b6fd7c"
+git-tree-sha1 = "a652c05f8f374861580d420b420fddf3e2e84312"
 uuid = "a09fc81d-aa75-5fe9-8630-4744c3626534"
-version = "0.8.13"
+version = "0.8.14"
 
 [[ImageFiltering]]
 deps = ["CatIndices", "ColorVectorSpace", "ComputationalResources", "DataStructures", "FFTViews", "FFTW", "ImageCore", "ImageMetadata", "LinearAlgebra", "MappedArrays", "OffsetArrays", "Requires", "StaticArrays", "Statistics", "TiledIteration"]
@@ -390,9 +387,9 @@ version = "0.6.11"
 
 [[ImageMetadata]]
 deps = ["AxisArrays", "ColorVectorSpace", "ImageAxes", "ImageCore", "IndirectArrays"]
-git-tree-sha1 = "5bedd77cb80ce2c51889414cd2de9e300217ee8d"
+git-tree-sha1 = "5c2c78dc11343d83320e790379e0f58de3aa1b7e"
 uuid = "bc367c6b-8a6b-528e-b4bd-a4b897500b49"
-version = "0.9.0"
+version = "0.9.1"
 
 [[ImageTransformations]]
 deps = ["AxisAlgorithms", "ColorVectorSpace", "CoordinateTransformations", "IdentityRanges", "ImageCore", "Interpolations", "OffsetArrays", "StaticArrays"]
@@ -456,6 +453,12 @@ git-tree-sha1 = "b34d7cef7b337321e97d22242c3c2b91f476748e"
 uuid = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
 version = "0.21.0"
 
+[[JuliaInterpreter]]
+deps = ["CodeTracking", "InteractiveUtils", "Random", "UUIDs"]
+git-tree-sha1 = "2eadbbde5534346cbb837c3a75b377cba477a06d"
+uuid = "aa1ae85d-cabe-5617-a682-6adf51b2e16a"
+version = "0.7.13"
+
 [[LAME_jll]]
 deps = ["Libdl", "Pkg"]
 git-tree-sha1 = "a46bff84977753fdba8db3c50db1435bb1eb4288"
@@ -480,6 +483,7 @@ uuid = "1b4a561d-cfcb-5daf-8433-43fcf8b4bea3"
 version = "0.4.1"
 
 [[LibGit2]]
+deps = ["Printf"]
 uuid = "76f85450-5226-5b5a-8eaa-529ad045b433"
 
 [[LibVPX_jll]]
@@ -509,6 +513,12 @@ version = "2.6.1"
 
 [[Logging]]
 uuid = "56ddb016-857b-54e1-b83d-db4d58db5568"
+
+[[LoweredCodeUtils]]
+deps = ["JuliaInterpreter"]
+git-tree-sha1 = "1c41621653250b2824b6e664ac5bd805558aeff9"
+uuid = "6f1432cf-f94c-5a45-995e-cdbf5db27b0b"
+version = "0.4.3"
 
 [[MIRT]]
 deps = ["BenchmarkTools", "Colors", "DSP", "Distributed", "Distributions", "Elliptic", "FFTViews", "FFTW", "FileIO", "ImageFiltering", "ImageTransformations", "LaTeXStrings", "LinearAlgebra", "LinearMaps", "MosaicViews", "NFFT", "Plots", "Printf", "REPL", "Random", "SharedArrays", "SparseArrays", "Test", "Wavelets"]
@@ -669,9 +679,9 @@ version = "0.6.5"
 
 [[Plots]]
 deps = ["Base64", "Contour", "Dates", "FFMPEG", "FixedPointNumbers", "GR", "GeometryTypes", "JSON", "LinearAlgebra", "Measures", "NaNMath", "Pkg", "PlotThemes", "PlotUtils", "Printf", "REPL", "Random", "RecipesBase", "RecipesPipeline", "Reexport", "Requires", "Showoff", "SparseArrays", "Statistics", "StatsBase", "UUIDs"]
-git-tree-sha1 = "e975cd074ccc195285fea8ba5e9c0044ee8cb949"
+git-tree-sha1 = "7a7e841838278d561d18b588f7202844d349c7e9"
 uuid = "91a5bcdd-55d7-5caf-9e0b-520d859cae80"
-version = "1.0.9"
+version = "1.0.10"
 
 [[Polynomials]]
 deps = ["Intervals", "LinearAlgebra", "RecipesBase"]
@@ -741,6 +751,12 @@ deps = ["UUIDs"]
 git-tree-sha1 = "d37400976e98018ee840e0ca4f9d20baa231dc6b"
 uuid = "ae029012-a4dd-5104-9daa-d747884805df"
 version = "1.0.1"
+
+[[Revise]]
+deps = ["CodeTracking", "Distributed", "FileWatching", "JuliaInterpreter", "LibGit2", "LoweredCodeUtils", "OrderedCollections", "Pkg", "REPL", "UUIDs", "Unicode"]
+git-tree-sha1 = "6cefbc0e3b62146e564a3cf209e7370a839883da"
+uuid = "295af30f-e4ad-537b-8983-00126c2a3abe"
+version = "2.6.0"
 
 [[Rmath]]
 deps = ["Random", "Rmath_jll"]
@@ -887,9 +903,9 @@ version = "0.5.2"
 
 [[XML2_jll]]
 deps = ["Libdl", "Libiconv_jll", "Pkg", "Zlib_jll"]
-git-tree-sha1 = "16f427f831b517101d0424ea1af0a2d31a5b6a1b"
+git-tree-sha1 = "987c02a43fa10a491a5f0f7c46a6d3559ed6a8e2"
 uuid = "02c8fc9c-b97f-50b9-bbe4-9be30ff0a78a"
-version = "2.9.9+3"
+version = "2.9.9+4"
 
 [[ZipFile]]
 deps = ["Libdl", "Printf", "Zlib_jll"]
